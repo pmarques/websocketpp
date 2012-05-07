@@ -42,6 +42,9 @@
 #include <boost/thread.hpp>
 #include <boost/thread/recursive_mutex.hpp>
 
+#include <boost/asio/signal_set.hpp>
+#include <sys/wait.h>
+
 #include <iostream>
 #include <stdexcept>
 
@@ -192,6 +195,7 @@ public:
     server(boost::asio::io_service& m) 
      : m_endpoint(static_cast< endpoint_type& >(*this)),
        m_io_service(m),
+       m_signal(m_io_service, SIGCHLD),
        // the only way to set an endpoint address family appears to be using
        // this constructor, which also requires a port. This port number can be
        // ignored, as it is always overwriten later by the listen() member func
@@ -234,10 +238,30 @@ private:
     
     endpoint_type&                  m_endpoint;
     boost::asio::io_service&        m_io_service;
+	boost::asio::signal_set         m_signal;
     boost::asio::ip::tcp::acceptor  m_acceptor;
     state                           m_state;
     
     boost::asio::deadline_timer     m_timer;
+
+    void start_signal_wait()
+    {
+    	m_signal.async_wait(boost::bind(&server::handle_signal_wait, this));
+    }
+    
+    void handle_signal_wait()
+    {
+    	// Only the parent process should check for this signal. We can determine
+    	// whether we are in the parent by checking if the acceptor is still open.
+    	if (m_acceptor.is_open())
+    	{
+    		// Reap completed child processes so that we don't end up with zombies.
+    		int status = 0;
+    		while (waitpid(-1, &status, WNOHANG) > 0) {}
+    
+    		start_signal_wait();
+    	}
+    }
 };
 
 template <class endpoint>
@@ -255,6 +279,8 @@ void server<endpoint>::listen(const boost::asio::ip::tcp::endpoint& e,size_t num
         m_acceptor.listen();
     
         this->start_accept();
+
+        start_signal_wait();
     }
     
     if (num_threads == 1) {
@@ -358,11 +384,42 @@ void server<endpoint>::handle_accept(connection_ptr con,
                 << " (" << con->m_fail_reason << ")" << log::endl;
         
         con->terminate(false);
+
+        this->start_accept();
     } else {
-        con->start();
+        m_io_service.notify_fork(boost::asio::io_service::fork_prepare);
+
+        if (fork() == 0)
+        {
+            // Inform the io_service that the fork is finished and that this is the
+            // child process. The io_service uses this opportunity to create any
+            // internal file descriptors that must be private to the new process.
+            m_io_service.notify_fork(boost::asio::io_service::fork_child);
+          
+            // The child won't be accepting new connections, so we can close the
+            // acceptor. It remains open in the parent.
+            m_acceptor.close();
+          
+            // The child process is not interested in processing the SIGCHLD signal.
+            m_signal.cancel();
+          
+            // start_read();
+            con->start();
+        }
+        else
+        {
+            // Inform the io_service that the fork is finished (or failed) and that
+            // this is the parent process. The io_service uses this opportunity to
+            // recreate any internal resources that were cleaned up during
+            // preparation for the fork.
+            m_io_service.notify_fork(boost::asio::io_service::fork_parent);
+
+            con->get_raw_socket().close();
+            // socket.close();
+
+            this->start_accept();
+        }
     }
-    
-    this->start_accept();
 }
     
 // server<endpoint>::connection<connnection_type> Implimentation
